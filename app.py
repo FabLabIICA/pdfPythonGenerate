@@ -7,7 +7,7 @@ import zipfile
 from docx import Document
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
-from mailmerge import MailMerge
+from mailmerge import MailMerge  # <-- IMPORTANTE: Se importa como mailmerge
 import openpyxl
 import pandas as pd
 import requests
@@ -49,7 +49,6 @@ def extraer_etiquetas_docx(doc_path):
   with MailMerge(doc_path) as mm:
     campos = list(mm.get_merge_fields())
 
-  # Fallback mediante Regex directa si el documento usa <<etiqueta>> estándar
   if not campos:
     doc = Document(doc_path)
     etiquetas = set()
@@ -75,7 +74,6 @@ def plantilla_datos():
 
     machote_io = descargar_machote_docx(url_machote)
 
-    # Guardar temporalmente para leer campos con MailMerge
     with tempfile.NamedTemporaryFile(delete=False, suffix='.docx') as tmp:
       tmp.write(machote_io.getvalue())
       tmp_path = tmp.name
@@ -86,7 +84,6 @@ def plantilla_datos():
     if not tags:
       tags = ['nombre', 'cedula', 'curso', 'fecha']
 
-    # Agregar columna obligatoria para personalizar el nombre del PDF
     columnas = ['nombre_archivo_pdf'] + [
         t for t in tags if t != 'nombre_archivo_pdf'
     ]
@@ -96,7 +93,6 @@ def plantilla_datos():
     ws.title = 'Plantilla Datos'
     ws.append(columnas)
 
-    # Fila de ejemplo
     ejemplo = ['certificado_ejemplo'] + [f'Dato {t}' for t in columnas[1:]]
     ws.append(ejemplo)
 
@@ -128,7 +124,6 @@ def generar_certificados():
 
     machote_bytes = descargar_machote_docx(url_machote).getvalue()
 
-    # Guardar machote temporal
     machote_path = os.path.join(temp_dir, 'machote.docx')
     with open(machote_path, 'wb') as f:
       f.write(machote_bytes)
@@ -141,12 +136,10 @@ def generar_certificados():
     zip_buffer = io.BytesIO()
     with zipfile.ZipFile(zip_buffer, 'w') as zip_file:
       for index, row in df.iterrows():
-        # Preparar diccionario de datos limpiando NaN
         row_dict = {}
         for k, v in row.items():
           row_dict[str(k)] = '' if pd.isna(v) else str(v)
 
-        # Nombre personalizado del archivo PDF definido en la hoja
         nombre_pdf = row_dict.get('nombre_archivo_pdf', '').strip()
         if not nombre_pdf:
           nombre_pdf = (
@@ -158,7 +151,6 @@ def generar_certificados():
             c for c in nombre_pdf if c.isalnum() or c in ('_', '-', '.')
         )
 
-        # Procesar con MailMerge para conservar líneas, figuras, firmas y estilos intactos
         with MailMerge(machote_path) as document:
           available_fields = document.get_merge_fields()
           filtered_dict = {
@@ -170,7 +162,6 @@ def generar_certificados():
           doc_out_path = os.path.join(temp_dir, f'{nombre_pdf}.docx')
           document.write(doc_out_path)
 
-        # Convertir a PDF (utilizando LibreOffice en entorno Linux / Render)
         pdf_out_path = os.path.join(temp_dir, f'{nombre_pdf}.pdf')
         subprocess.run(
             [
@@ -217,4 +208,6 @@ def generar_certificados():
 
 
 if __name__ == '__main__':
-  app.run(host='0.0.0.0', port=5000)
+  # IMPORTANTE: Tomar el puerto que asigna Render dinámicamente
+  port = int(os.environ.get('PORT', 5000))
+  app.run(host='0.0.0.0', port=port)
