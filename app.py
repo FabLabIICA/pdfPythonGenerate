@@ -1,135 +1,104 @@
 import io
+import os
 import re
+import subprocess
+import tempfile
 import zipfile
+from docx import Document
+from docx-mailmerge import MailMerge
+from flask import Flask, jsonify, request, send_file
+from flask_cors import CORS
 import openpyxl
 import pandas as pd
 import requests
-from docx import Document
-from flask import Flask, jsonify, request, send_file
-from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
 
 def convertir_enlace_drive(url):
-  """Convierte un enlace de Google Drive o Google Docs en un enlace de descarga directa."""
+  """Convierte enlaces de Google Drive / Docs para descarga directa."""
   if not url:
     return url
-
-  # Si es un documento de Google Docs, exportarlo como docx
   match_docs = re.search(r'/document/d/([a-zA-Z0-9_-]+)', url)
   if match_docs:
-    file_id = match_docs.group(1)
-    return f'https://docs.google.com/document/d/{file_id}/export?format=docx'
-
-  # Si es un archivo estándar en Google Drive
+    return (
+        f"https://docs.google.com/document/d/{match_docs.group(1)}/export?format=docx"
+    )
   match_drive = re.search(r'/file/d/([a-zA-Z0-9_-]+)', url)
   if match_drive:
-    file_id = match_drive.group(1)
-    return f'https://drive.google.com/uc?export=download&id={file_id}'
-
+    return (
+        f"https://drive.google.com/uc?export=download&id={match_drive.group(1)}"
+    )
   return url
 
 
 def descargar_machote_docx(url):
-  """Descarga el archivo docx desde el enlace procesado de Google Drive."""
   url_directa = convertir_enlace_drive(url)
   response = requests.get(url_directa)
   if response.status_code != 200:
     raise Exception(
-        'No se pudo descargar el machote desde Google Drive. Asegúrate de que'
-        ' el archivo sea público.'
+        "No se pudo descargar el machote desde Google Drive. Asegúrate de que"
+        " sea público."
     )
   return io.BytesIO(response.content)
 
 
-def extraer_etiquetas_docx(doc):
-  """Extrae todas las etiquetas <<etiqueta>> o {{etiqueta}} del documento Word."""
-  etiquetas = set()
+def extraer_etiquetas_docx(doc_path):
+  """Extrae etiquetas conservando la compatibilidad con MailMerge y llaves dobles/triples."""
+  with MailMerge(doc_path) as mm:
+    campos = list(mm.get_merge_fields())
 
-  # Buscar en párrafos
-  for p in doc.paragraphs:
-    texto = ''.join([run.text for run in p.runs])
-    matches = re.findall(r'<<(.*?)>>|\{\{(.*?)\}\}', texto)
-    for m in matches:
-      tag = m[0] if m[0] else m[1]
-      if tag.strip():
-        etiquetas.add(tag.strip())
+  # Fallback mediante Regex directa si el documento usa <<etiqueta>> estándar
+  if not campos:
+    doc = Document(doc_path)
+    etiquetas = set()
+    for p in doc.paragraphs:
+      texto = "".join([run.text for run in p.runs])
+      matches = re.findall(r"<<(.*?)>>|\{\{(.*?)\}\}", texto)
+      for m in matches:
+        tag = m[0] if m[0] else m[1]
+        if tag.strip():
+          etiquetas.add(tag.strip())
+    campos = list(etiquetas)
 
-  # Buscar en tablas
-  for table in doc.tables:
-    for row in table.rows:
-      for cell in row.cells:
-        for p in cell.paragraphs:
-          texto = ''.join([run.text for run in p.runs])
-          matches = re.findall(r'<<(.*?)>>|\{\{(.*?)\}\}', texto)
-          for m in matches:
-            tag = m[0] if m[0] else m[1]
-            if tag.strip():
-              etiquetas.add(tag.strip())
-
-  return list(etiquetas)
+  return campos
 
 
-def reemplazar_etiquetas_en_doc(doc, row):
-  """Reemplaza las etiquetas <<etiqueta>> o {{etiqueta}} con los datos de la fila."""
-  for paragraph in doc.paragraphs:
-    texto_completo = ''.join([run.text for run in paragraph.runs])
-    for key, val in row.items():
-      val_str = '' if pd.isna(val) else str(val)
-      texto_completo = texto_completo.replace(f'<<{key}>>', val_str)
-      texto_completo = texto_completo.replace(f'{{{{{key}}}}}', val_str)
-
-    if paragraph.runs:
-      paragraph.runs[0].text = texto_completo
-      for run in paragraph.runs[1:]:
-        run.text = ''
-
-  for table in doc.tables:
-    for row_table in table.rows:
-      for cell in row_table.cells:
-        for p in cell.paragraphs:
-          texto_celda = ''.join([run.text for run in p.runs])
-          for key, val in row.items():
-            val_str = '' if pd.isna(val) else str(val)
-            texto_celda = texto_celda.replace(f'<<{key}>>', val_str)
-            texto_celda = texto_celda.replace(f'{{{{{key}}}}}', val_str)
-
-          if p.runs:
-            p.runs[0].text = texto_celda
-            for run in p.runs[1:]:
-              run.text = ''
-
-
-@app.route('/api/plantilla-datos', methods=['POST'])
+@app.route("/api/plantilla-datos", methods=["POST"])
 def plantilla_datos():
-  """Endpoint que lee el machote de Drive, extrae las etiquetas y devuelve un Excel con ellas."""
   try:
     data = request.get_json()
-    url_machote = data.get('url')
-
+    url_machote = data.get("url")
     if not url_machote:
-      return jsonify({'error': 'Falta la URL del machote'}), 400
+      return jsonify({"error": "Falta la URL del machote"}), 400
 
-    # Descargar y analizar el Word
     machote_io = descargar_machote_docx(url_machote)
-    doc = Document(machote_io)
-    tags = extraer_etiquetas_docx(doc)
+
+    # Guardar temporalmente para leer campos con MailMerge
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".docx") as tmp:
+      tmp.write(machote_io.getvalue())
+      tmp_path = tmp.name
+
+    tags = extraer_etiquetas_docx(tmp_path)
+    os.unlink(tmp_path)
 
     if not tags:
-      tags = [
-          'nombre',
-          'cedula',
-          'curso',
-          'fecha',
-      ]  # Fallback si no encuentra etiquetas
+      tags = ["nombre", "cedula", "curso", "fecha"]
 
-    # Crear Excel en memoria con openpyxl
+    # Agregar columna obligatoria para personalizar el nombre del PDF
+    columnas = ["nombre_archivo_pdf"] + [
+        t for t in tags if t != "nombre_archivo_pdf"
+    ]
+
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = 'Plantilla Datos'
-    ws.append(tags)
+    ws.title = "Plantilla Datos"
+    ws.append(columnas)
+
+    # Fila de ejemplo
+    ejemplo = ["certificado_ejemplo"] + [f"Dato {t}" for t in columnas[1:]]
+    ws.append(ejemplo)
 
     excel_io = io.BytesIO()
     wb.save(excel_io)
@@ -138,63 +107,117 @@ def plantilla_datos():
     return send_file(
         excel_io,
         mimetype=(
-            'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         ),
         as_attachment=True,
-        download_name='plantilla_datos.xlsx',
+        download_name="plantilla_datos_certificado.xlsx",
     )
   except Exception as e:
-    return jsonify({'error': str(e)}), 500
+    return jsonify({"error": str(e)}), 500
 
 
-@app.route('/api/generar-certificados', methods=['POST'])
+@app.route("/api/generar-certificados", methods=["POST"])
 def generar_certificados():
-  """Endpoint que descarga el machote del catálogo y procesa el archivo de datos subido."""
+  temp_dir = tempfile.mkdtemp()
   try:
-    url_machote = request.form.get('url_machote')
-    file_datos = request.files.get('archivo_datos')
+    url_machote = request.form.get("url_machote")
+    file_datos = request.files.get("archivo_datos")
 
     if not url_machote or not file_datos:
-      return jsonify({'error': 'Faltan parámetros o archivos'}), 400
+      return jsonify({"error": "Faltan parámetros o archivos"}), 400
 
-    # Descargar machote desde Drive
     machote_bytes = descargar_machote_docx(url_machote).getvalue()
 
-    # Leer archivo de datos
-    if file_datos.filename.endswith('.xlsx'):
+    # Guardar machote temporal
+    machote_path = os.path.join(temp_dir, "machote.docx")
+    with open(machote_path, "wb") as f:
+      f.write(machote_bytes)
+
+    if file_datos.filename.endswith(".xlsx"):
       df = pd.read_excel(file_datos)
     else:
       df = pd.read_csv(file_datos)
 
-    # Crear ZIP con los certificados generados
     zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, 'w') as zip_file:
+    with zipfile.ZipFile(zip_buffer, "w") as zip_file:
       for index, row in df.iterrows():
-        doc = Document(io.BytesIO(machote_bytes))
-        reemplazar_etiquetas_en_doc(doc, row)
+        # Preparar diccionario de datos limpiando NaN
+        row_dict = {}
+        for k, v in row.items():
+          row_dict[str(k)] = "" if pd.isna(v) else str(v)
 
-        doc_io = io.BytesIO()
-        doc.save(doc_io)
-        doc_io.seek(0)
-
-        nombre_val = (
-            str(row.iloc[0]).replace(' ', '_')
-            if len(row) > 0
-            else f'user_{index}'
+        # Nombre personalizado del archivo PDF definido en la hoja
+        nombre_pdf = row_dict.get("nombre_archivo_pdf", "").strip()
+        if not nombre_pdf:
+          nombre_pdf = (
+              str(row.iloc[1]).replace(" ", "_")
+              if len(row) > 1
+              else f"certificado_{index}"
+          )
+        nombre_pdf = "".join(
+            c for c in nombre_pdf if c.isalnum() or c in ("_", "-", ".")
         )
-        nombre_archivo = f'certificado_{nombre_val}.docx'
-        zip_file.writestr(nombre_archivo, doc_io.read())
+
+        # Procesar con MailMerge para conservar líneas, figuras, firmas y estilos intactos
+        with MailMerge(machote_path) as document:
+          # Filtrar campos disponibles en el docx
+          available_fields = document.get_merge_fields()
+          filtered_dict = {
+              k: v for k, v in row_dict.items() if k in available_fields
+          }
+          if filtered_dict:
+            document.merge(**filtered_dict)
+
+          doc_out_path = os.path.join(temp_dir, f"{nombre_pdf}.docx")
+          document.write(doc_out_path)
+
+        # Convertir a PDF (utilizando LibreOffice en entorno Linux / Render)
+        pdf_out_path = os.path.join(temp_dir, f"{nombre_pdf}.pdf")
+        subprocess.run(
+            [
+                "libreoffice",
+                "--headless",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                temp_dir,
+                doc_out_path,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+
+        if os.path.exists(pdf_out_path):
+          with open(pdf_out_path, "rb") as pf:
+            zip_file.writestr(f"{nombre_pdf}.pdf", pf.read())
+        else:
+          # Fallback si LibreOffice no estuviera disponible: incluye el Word generado
+          with open(doc_out_path, "rb") as wf:
+            zip_file.writestr(f"{nombre_pdf}.docx", wf.read())
 
     zip_buffer.seek(0)
     return send_file(
         zip_buffer,
-        mimetype='application/zip',
+        mimetype="application/zip",
         as_attachment=True,
-        download_name='certificados_generados.zip',
+        download_name="certificados_pdf.zip",
     )
+
   except Exception as e:
-    return jsonify({'error': str(e)}), 500
+    return jsonify({"error": str(e)}), 500
+  finally:
+    # Limpieza de temporales
+    for root, dirs, files in os.walk(temp_dir, topdown=False):
+      for name in files:
+        try:
+          os.remove(os.path.join(root, name))
+        except:
+          pass
+      try:
+        os.rmdir(root)
+      except:
+        pass
 
 
-if __name__ == '__main__':
-  app.run(host='0.0.0.0', port=5000)
+if __name__ == "__main__":
+  app.run(host="0.0.0.0", port=5000)
