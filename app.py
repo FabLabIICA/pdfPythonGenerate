@@ -37,8 +37,7 @@ def descargar_machote_docx(url):
     response = requests.get(url_directa)
     if response.status_code != 200:
         raise Exception(
-            'No se pudo descargar el machote desde Google Drive. Asegúrate de que'
-            ' sea público.'
+            'No se pudo descargar el machote desde Google Drive. Asegúrate de que sea público.'
         )
     return io.BytesIO(response.content)
 
@@ -48,7 +47,6 @@ def extraer_etiquetas_docx(doc_path):
     doc = Document(doc_path)
     etiquetas = set()
     
-    # Buscar en párrafos normales
     for p in doc.paragraphs:
         texto = ''.join([run.text for run in p.runs])
         matches = re.findall(r'<<(.*?)>>|\{\{(.*?)\}\}', texto)
@@ -57,7 +55,6 @@ def extraer_etiquetas_docx(doc_path):
             if tag.strip():
                 etiquetas.add(tag.strip())
                 
-    # Buscar también dentro de tablas (por si el certificado tiene tablas)
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -82,13 +79,11 @@ def reemplazar_etiquetas_en_doc(doc, row_dict):
                 texto_parrafo = texto_parrafo.replace(f"{{{{{key}}}}}", val_str)
                 texto_parrafo = texto_parrafo.replace(f"<<{key}>>", val_str)
             
-            # Reasignar el texto al primer run y vaciar los demás para no romper estilos
             if p.runs:
                 p.runs[0].text = texto_parrafo
                 for run in p.runs[1:]:
                     run.text = ""
 
-    # Repetir el mismo proceso para las tablas del documento
     for table in doc.tables:
         for row in table.rows:
             for cell in row.cells:
@@ -175,58 +170,57 @@ def generar_certificados():
         else:
             df = pd.read_csv(file_datos)
 
+        # PASO 1: Generar todos los archivos .docx de forma masiva
+        for index, row in df.iterrows():
+            row_dict = {}
+            for k, v in row.items():
+                row_dict[str(k)] = '' if pd.isna(v) else str(v)
+
+            nombre_pdf = row_dict.get('nombre_archivo_pdf', '').strip()
+            if not nombre_pdf:
+                nombre_pdf = (
+                    str(row.iloc[1]).replace(' ', '_')
+                    if len(row) > 1
+                    else f'certificado_{index}'
+                )
+            nombre_pdf = ''.join(
+                c for c in nombre_pdf if c.isalnum() or c in ('_', '-', '.')
+            )
+
+            document = Document(machote_path)
+            reemplazar_etiquetas_en_doc(document, row_dict)
+
+            doc_out_path = os.path.join(temp_dir, f'{nombre_pdf}.docx')
+            document.save(doc_out_path)
+
+        # PASO 2: Convertir toda la carpeta de golpe con UNA SOLA ejecución de LibreOffice
+        try:
+            proceso = subprocess.run(
+                [
+                    'libreoffice',
+                    '--headless',
+                    '--convert-to',
+                    'pdf',
+                    '--outdir',
+                    temp_dir,
+                    os.path.join(temp_dir, '*.docx'),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                check=True
+            )
+        except subprocess.CalledProcessError as sub_err:
+            raise Exception(f"Error convirtiendo lote a PDF con LibreOffice: {sub_err.stderr}")
+
+        # PASO 3: Empaquetar todos los PDFs generados en el archivo ZIP
         zip_buffer = io.BytesIO()
         with zipfile.ZipFile(zip_buffer, 'w') as zip_file:
-            for index, row in df.iterrows():
-                row_dict = {}
-                for k, v in row.items():
-                    row_dict[str(k)] = '' if pd.isna(v) else str(v)
-
-                nombre_pdf = row_dict.get('nombre_archivo_pdf', '').strip()
-                if not nombre_pdf:
-                    nombre_pdf = (
-                        str(row.iloc[1]).replace(' ', '_')
-                        if len(row) > 1
-                        else f'certificado_{index}'
-                    )
-                nombre_pdf = ''.join(
-                    c for c in nombre_pdf if c.isalnum() or c in ('_', '-', '.')
-                )
-
-                # Abrir el documento con python-docx y reemplazar el texto directamente
-                document = Document(machote_path)
-                reemplazar_etiquetas_en_doc(document, row_dict)
-
-                doc_out_path = os.path.join(temp_dir, f'{nombre_pdf}.docx')
-                document.save(doc_out_path)
-
-                pdf_out_path = os.path.join(temp_dir, f'{nombre_pdf}.pdf')
-                
-                try:
-                    proceso = subprocess.run(
-                        [
-                            'libreoffice',
-                            '--headless',
-                            '--convert-to',
-                            'pdf',
-                            '--outdir',
-                            temp_dir,
-                            doc_out_path,
-                        ],
-                        stdout=subprocess.PIPE,
-                        stderr=subprocess.PIPE,
-                        text=True,
-                        check=True
-                    )
-                except subprocess.CalledProcessError as sub_err:
-                    raise Exception(f"Error convirtiendo a PDF con LibreOffice: {sub_err.stderr}")
-
-                if os.path.exists(pdf_out_path):
-                    with open(pdf_out_path, 'rb') as pf:
-                        zip_file.writestr(f'{nombre_pdf}.pdf', pf.read())
-                else:
-                    with open(doc_out_path, 'rb') as wf:
-                        zip_file.writestr(f'{nombre_pdf}.docx', wf.read())
+            for filename in os.listdir(temp_dir):
+                if filename.endswith('.pdf'):
+                    pdf_path = os.path.join(temp_dir, filename)
+                    with open(pdf_path, 'rb') as pf:
+                        zip_file.writestr(filename, pf.read())
 
         zip_buffer.seek(0)
         return send_file(
