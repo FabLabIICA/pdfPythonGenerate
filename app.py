@@ -170,7 +170,8 @@ def generar_certificados():
         else:
             df = pd.read_csv(file_datos)
 
-        # PASO 1: Generar todos los archivos .docx de forma masiva
+        # PASO 1: Generar todos los archivos .docx
+        archivos_docx = []
         for index, row in df.iterrows():
             row_dict = {}
             for k, v in row.items():
@@ -192,26 +193,28 @@ def generar_certificados():
 
             doc_out_path = os.path.join(temp_dir, f'{nombre_pdf}.docx')
             document.save(doc_out_path)
+            archivos_docx.append(doc_out_path)
 
-        # PASO 2: Convertir toda la carpeta de golpe con UNA SOLA ejecución de LibreOffice
-        try:
-            proceso = subprocess.run(
-                [
-                    'libreoffice',
-                    '--headless',
-                    '--convert-to',
-                    'pdf',
-                    '--outdir',
-                    temp_dir,
-                    os.path.join(temp_dir, '*.docx'),
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                check=True
-            )
-        except subprocess.CalledProcessError as sub_err:
-            raise Exception(f"Error convirtiendo lote a PDF con LibreOffice: {sub_err.stderr}")
+        # PASO 2: Convertir cada archivo asegurando la ruta exacta
+        for doc_path in archivos_docx:
+            try:
+                subprocess.run(
+                    [
+                        'libreoffice',
+                        '--headless',
+                        '--convert-to',
+                        'pdf',
+                        '--outdir',
+                        temp_dir,
+                        doc_path,
+                    ],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    check=True
+                )
+            except subprocess.CalledProcessError as sub_err:
+                raise Exception(f"Error convirtiendo a PDF con LibreOffice: {sub_err.stderr}")
 
         # PASO 3: Empaquetar todos los PDFs generados en el archivo ZIP
         zip_buffer = io.BytesIO()
@@ -246,6 +249,7 @@ def generar_certificados():
                 os.rmdir(root)
             except:
                 pass
+
 
 
 if __name__ == '__main__':
