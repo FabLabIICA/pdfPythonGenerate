@@ -7,7 +7,6 @@ import zipfile
 from docx import Document
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
-from mailmerge import MailMerge
 import openpyxl
 import pandas as pd
 import requests
@@ -45,23 +44,65 @@ def descargar_machote_docx(url):
 
 
 def extraer_etiquetas_docx(doc_path):
-    """Extrae etiquetas conservando la compatibilidad con MailMerge y llaves dobles/triples."""
-    with MailMerge(doc_path) as mm:
-        campos = list(mm.get_merge_fields())
+    """Extrae etiquetas basadas en texto plano tipo {{etiqueta}} o <<etiqueta>>."""
+    doc = Document(doc_path)
+    etiquetas = set()
+    
+    # Buscar en párrafos normales
+    for p in doc.paragraphs:
+        texto = ''.join([run.text for run in p.runs])
+        matches = re.findall(r'<<(.*?)>>|\{\{(.*?)\}\}', texto)
+        for m in matches:
+            tag = m[0] if m[0] else m[1]
+            if tag.strip():
+                etiquetas.add(tag.strip())
+                
+    # Buscar también dentro de tablas (por si el certificado tiene tablas)
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    texto = ''.join([run.text for run in p.runs])
+                    matches = re.findall(r'<<(.*?)>>|\{\{(.*?)\}\}', texto)
+                    for m in matches:
+                        tag = m[0] if m[0] else m[1]
+                        if tag.strip():
+                            etiquetas.add(tag.strip())
 
-    if not campos:
-        doc = Document(doc_path)
-        etiquetas = set()
-        for p in doc.paragraphs:
-            texto = ''.join([run.text for run in p.runs])
-            matches = re.findall(r'<<(.*?)>>|\{\{(.*?)\}\}', texto)
-            for m in matches:
-                tag = m[0] if m[0] else m[1]
-                if tag.strip():
-                    etiquetas.add(tag.strip())
-        campos = list(etiquetas)
+    return list(etiquetas)
 
-    return campos
+
+def reemplazar_etiquetas_en_doc(doc, row_dict):
+    """Reemplaza etiquetas del tipo {{tag}} o <<tag>> respetando el formato de los runs."""
+    for p in doc.paragraphs:
+        texto_parrafo = ''.join([run.text for run in p.runs])
+        if "{{" in texto_parrafo or "<<" in texto_parrafo:
+            for key, val in row_dict.items():
+                val_str = str(val) if val is not None else ""
+                texto_parrafo = texto_parrafo.replace(f"{{{{{key}}}}}", val_str)
+                texto_parrafo = texto_parrafo.replace(f"<<{key}>>", val_str)
+            
+            # Reasignar el texto al primer run y vaciar los demás para no romper estilos
+            if p.runs:
+                p.runs[0].text = texto_parrafo
+                for run in p.runs[1:]:
+                    run.text = ""
+
+    # Repetir el mismo proceso para las tablas del documento
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    texto_parrafo = ''.join([run.text for run in p.runs])
+                    if "{{" in texto_parrafo or "<<" in texto_parrafo:
+                        for key, val in row_dict.items():
+                            val_str = str(val) if val is not None else ""
+                            texto_parrafo = texto_parrafo.replace(f"{{{{{key}}}}}", val_str)
+                            texto_parrafo = texto_parrafo.replace(f"<<{key}>>", val_str)
+                        if p.runs:
+                            p.runs[0].text = texto_parrafo
+                            for run in p.runs[1:]:
+                                run.text = ""
 
 
 @app.route('/api/plantilla-datos', methods=['POST'])
@@ -152,16 +193,12 @@ def generar_certificados():
                     c for c in nombre_pdf if c.isalnum() or c in ('_', '-', '.')
                 )
 
-                with MailMerge(machote_path) as document:
-                    available_fields = document.get_merge_fields()
-                    filtered_dict = {
-                        k: v for k, v in row_dict.items() if k in available_fields
-                    }
-                    if filtered_dict:
-                        document.merge(**filtered_dict)
+                # Abrir el documento con python-docx y reemplazar el texto directamente
+                document = Document(machote_path)
+                reemplazar_etiquetas_en_doc(document, row_dict)
 
-                    doc_out_path = os.path.join(temp_dir, f'{nombre_pdf}.docx')
-                    document.write(doc_out_path)
+                doc_out_path = os.path.join(temp_dir, f'{nombre_pdf}.docx')
+                document.save(doc_out_path)
 
                 pdf_out_path = os.path.join(temp_dir, f'{nombre_pdf}.pdf')
                 
